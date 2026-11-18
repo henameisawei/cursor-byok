@@ -1036,9 +1036,22 @@ pub(super) async fn wait_for_state_ready(
     ready: tokio::sync::oneshot::Receiver<std::result::Result<(), String>>,
     cancellation: &CancellationToken,
 ) -> std::result::Result<(), RunOutcome> {
+    const STATE_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     let result = tokio::select! {
         biased;
-        result = ready => result,
+        result = tokio::time::timeout(STATE_READY_TIMEOUT, ready) => match result {
+            // Barrier resolved in time; honor its result.
+            Ok(result) => result,
+            // The client never confirmed the state commit. Proceed anyway so
+            // the model call is not blocked forever (seen with Cursor 3.30
+            // conversations that carry no ConversationStateStructure).
+            Err(_) => {
+                tracing::warn!(
+                    "state ready barrier timed out after {STATE_READY_TIMEOUT:?}; proceeding"
+                );
+                Ok(Ok(()))
+            }
+        },
         _ = cancellation.cancelled() => return Err(RunOutcome::Cancelled),
     };
     match result {

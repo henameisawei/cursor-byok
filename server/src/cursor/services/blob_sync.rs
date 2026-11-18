@@ -99,6 +99,20 @@ impl BlobSynchronizer {
         if self.inner.acked_blobs.lock().await.contains(blob_id) {
             return Ok(());
         }
+        // Cursor >= 3.30 local-loop inference (RunInferenceSSE) drives the
+        // prompt inline via `invoke_model` and never sends KV SET
+        // acknowledgements. Emitting blob SETs and waiting for ACKs here would
+        // block the checkpoint barrier until SET_TIMEOUT (30 min), so the run
+        // never reaches text emission and the client spins forever. The blob is
+        // already persisted locally by `persist()`; skip the wire sync entirely.
+        if self.inner.handle.invocation_id().is_some() {
+            tracing::info!(
+                request_id = self.request_id(),
+                blob_id = blob_id.to_base64(),
+                "blob_sync: RunInferenceSSE detected, skipping blob SET (client has inline prompt)"
+            );
+            return Ok(());
+        }
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
         self.inner.set_requests.lock().await.insert(

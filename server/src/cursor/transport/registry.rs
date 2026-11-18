@@ -219,6 +219,19 @@ impl TransportRegistry {
             .map(|transport| transport.handle.clone())
     }
 
+    /// Newest local transport, used when a client channel identifies the run by
+    /// an id that was never registered (Cursor 3.30 dials the run WebSocket
+    /// before its first append on some paths).
+    pub async fn latest_local(&self) -> Option<TransportHandle> {
+        self.inner
+            .local
+            .lock()
+            .await
+            .values()
+            .max_by_key(|transport| transport.generation)
+            .map(|transport| transport.handle.clone())
+    }
+
     pub async fn mark_upstream(&self, request_id: &str) {
         let mut upstream = self.inner.upstream.lock().await;
         let generation = upstream.get(request_id).copied().unwrap_or_default() + 1;

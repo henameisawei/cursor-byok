@@ -309,34 +309,55 @@ enum AgentMode {
 }
 
 // Copied from: local:agent.v1.AgentRunRequest (var: Tvs)
+// Adapted for Cursor >= 3.30: field numbering was re-arranged upstream.
+// Probe of 2026-11 payloads:
+//   1  string conversation id (UUID)      [was ConversationStateStructure]
+//   4  { kind varint, text string }       [user message; was McpTools]
+//   5  string "agent"                     [harness-ish; was conversation_id]
+//   7  repeated model entries             [was SkillOptions]
+//   11 message                           [was string subagent_type_name]
+//   17/18/25 varints                     [were PreFetchedBlob/string/string]
+// Fields whose payloads we do not need are deleted so prost skips them as
+// unknown fields (this also removes the wire-type conflicts).
 message AgentRunRequest {
-  ConversationStateStructure conversation_state = 1;
+  // Cursor 3.30 follow-up turns send a nested protobuf message here (non-UTF8).
+  // Declared as bytes so prost accepts both the empty string (first turn) and
+  // the structured conversation id (follow-up turns) without UTF8 validation.
+  optional bytes conversation_id_330 = 1;
   ConversationAction action = 2;
   ModelDetails model_details = 3;
-  optional RequestedModel requested_model = 9;
-  McpTools mcp_tools = 4;
+  optional AgentUserContent330 user_content = 4;
   optional string conversation_id = 5;
   optional McpFileSystemOptions mcp_file_system_options = 6;
-  optional SkillOptions skill_options = 7;
   optional string custom_system_prompt = 8;
+  optional RequestedModel requested_model = 9;
   optional bool suggest_next_prompt = 10;
-  optional string subagent_type_name = 11;
-  optional bool exclude_workspace_context = 12;
+  // Cursor 3.30 follow-up turns carry the previous turn's request id here.
+  // Declaring this as bool makes prost reject the whole BidiAppend payload
+  // with a wire-type mismatch (the actual value is a length-delimited UUID),
+  // which is why the second question in a session always returned 400.
+  optional string previous_request_id = 12;
   optional string harness = 13;
   repeated RequestedModel selected_subagent_models = 14;
   repeated ModelDetails selected_subagent_model_details = 15;
   optional string conversation_group_id = 16;
-  repeated PreFetchedBlob pre_fetched_blobs = 17;
-  optional string dev_raw_model_slug = 18;
   optional bool client_supports_inline_images = 19;
   repeated SubagentModelOverride subagent_model_overrides = 20;
   optional bool can_create_cloud_subagents = 21;
   optional bool suppress_subagent_progress_update_tool = 22;
   optional bool client_supports_send_to_user = 23;
   optional string computer_use_coordinate_mode = 24;
-  optional string run_id = 25;
   optional string agent_session_id = 26;
   optional bool client_supports_prompt_context_usage_rpc = 27;
+  // Legacy full conversation state (field 1 pre-3.30). 3.30 clients never
+  // send it; re-numbered so existing code compiles and always sees None.
+  ConversationStateStructure conversation_state = 100;
+}
+
+// Cursor >= 3.30 user message wrapper carried in AgentRunRequest field 4.
+message AgentUserContent330 {
+  optional int64 kind = 1;
+  optional string text = 2;
 }
 
 // Copied from: local:agent.v1.AgentServerMessage (var: qW)

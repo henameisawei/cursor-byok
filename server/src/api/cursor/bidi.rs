@@ -17,6 +17,14 @@ pub struct DecodedAppend {
     pub request_id: String,
     pub seqno: i64,
     pub message: agent::AgentClientMessage,
+    /// Client-generated invocation id extracted from a 3.30
+    /// `RunInferenceClientMessage.invoke_model` frame. Stored on the transport
+    /// handle so the RunInferenceSSE bridge can echo it back verbatim.
+    pub invocation_id: Option<String>,
+    /// True when the frame was a new-protocol inference control frame (e.g.
+    /// `invoke_model`). Such frames only carry the invocation id / prompt and
+    /// must NOT be replayed into the legacy run engine.
+    pub is_inference_control: bool,
 }
 
 impl DecodedAppend {
@@ -109,7 +117,6 @@ impl DecodedAppend {
             "conversation_history_images": history_images,
             "root_message_count": state.map_or(0, |state| state.root_prompt_messages_json.len()),
             "turn_count": state.map_or(0, |state| state.turns.len()),
-            "prefetched_blob_count": request.pre_fetched_blobs.len(),
         })
     }
 }
@@ -160,23 +167,162 @@ pub fn decode(request: &ai::BidiAppendRequest) -> Result<DecodedAppend> {
         .map(|id| id.request_id.as_str())
         .filter(|id| !id.is_empty())
         .ok_or_else(|| Error::Protocol("BidiAppend request_id is required".into()))?;
-    if !request.data_binary.is_empty() {
-        return Err(Error::Protocol(
-            "BidiAppend data_binary is not part of the captured protocol".into(),
-        ));
-    }
-    if request.data.is_empty() {
+    // Cursor >= 3.30 sends the AgentClientMessage as raw protobuf bytes in
+    // `data_binary` instead of the legacy hex string in `data`. The binary
+    // payload may carry a transport envelope (Connect 5-byte frame, a varint
+    // length prefix) or concatenate several messages, so probe the known
+    // encodings before giving up.
+    let raw: Vec<u8> = if !request.data_binary.is_empty() {
+        request.data_binary.clone()
+    } else if !request.data.is_empty() {
+        hex::decode(&request.data)
+            .map_err(|error| Error::Protocol(format!("invalid BidiAppend hex: {error}")))?
+    } else {
         return Err(Error::Protocol(
             "BidiAppend contains no AgentClientMessage".into(),
         ));
+    };
+    tracing::warn!(
+        "BidiAppend payload probe: data_len={} bin_len={} data_head={} bin_head={}",
+        request.data.len(),
+        raw.len(),
+        &request.data[..request.data.len().min(120)],
+        hex::encode(&raw[..raw.len().min(120)])
+    );
+    match decode_agent_message(&raw) {
+        Ok(message) => {
+            let message = normalize(message);
+            Ok(DecodedAppend {
+                request_id: request_id.into(),
+                seqno: request.append_seqno,
+                message,
+                invocation_id: None,
+                is_inference_control: false,
+            })
+        }
+        Err(legacy_error) => {
+            // Cursor >= 3.30 local loop multiplexes `RunInferenceClientMessage`
+            // frames through BidiAppend.data_binary. These carry the
+            // client-generated invocation id we must echo back on the SSE
+            // bridge. Recognise them instead of rejecting with 400.
+            if let Some(invocation_id) = decode_inference_invocation_id(&raw) {
+                tracing::info!(
+                    request_id,
+                    invocation_id = %invocation_id,
+                    "BidiAppend: decoded RunInferenceClientMessage.invoke_model"
+                );
+                return Ok(DecodedAppend {
+                    request_id: request_id.into(),
+                    seqno: request.append_seqno,
+                    message: agent::AgentClientMessage::default(),
+                    invocation_id: Some(invocation_id),
+                    is_inference_control: true,
+                });
+            }
+            tracing::warn!(
+                "BidiAppend full payload hex ({} bytes): {}",
+                raw.len(),
+                hex::encode(&raw)
+            );
+            Err(legacy_error)
+        }
     }
-    let payload = hex::decode(&request.data)
-        .map_err(|error| Error::Protocol(format!("invalid BidiAppend hex: {error}")))?;
-    Ok(DecodedAppend {
-        request_id: request_id.into(),
-        seqno: request.append_seqno,
-        message: agent::AgentClientMessage::decode(payload.as_slice())?,
-    })
+}
+
+/// Try to decode a 3.30 `RunInferenceClientMessage` and pull the invocation id
+/// out of `invoke_model` (field 2 -> field 1). Bare protobuf and the standard
+/// 5-byte Connect frame envelope are both accepted.
+fn decode_inference_invocation_id(raw: &[u8]) -> Option<String> {
+    let candidates: [&[u8]; 2] = [
+        raw,
+        if raw.len() > 5 { &raw[5..] } else { &[] },
+    ];
+    for bytes in candidates {
+        if bytes.is_empty() {
+            continue;
+        }
+        if let Ok(message) = ai::RunInferenceClientMessage::decode(bytes) {
+            if let Some(invoke) = message.invoke_model {
+                if !invoke.invocation_id.is_empty() {
+                    return Some(invoke.invocation_id);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Cursor >= 3.30 moved the real conversation id to field 1 while field 5
+/// now carries a harness marker ("agent"). Copy the UUID over so the rest
+/// of the server keeps reading `conversation_id`.
+fn normalize(mut message: agent::AgentClientMessage) -> agent::AgentClientMessage {
+    if let Some(agent::agent_client_message::Message::RunRequest(request)) =
+        message.message.as_mut()
+    {
+        if let Some(id_bytes) = request.conversation_id_330.take() {
+            // 3.30 first turn sends an empty field; follow-up turns send a
+            // nested non-UTF8 message. Only copy when it is a valid UTF8 UUID.
+            if let Ok(id) = String::from_utf8(id_bytes) {
+                if !id.is_empty() {
+                    request.conversation_id = Some(id);
+                }
+            }
+        }
+    }
+    message
+}
+
+fn try_decode(bytes: &[u8]) -> Option<agent::AgentClientMessage> {
+    agent::AgentClientMessage::decode(bytes).ok()
+}
+
+fn decode_agent_message(raw: &[u8]) -> Result<agent::AgentClientMessage> {
+    // 1. Bare protobuf.
+    if let Some(message) = try_decode(raw) {
+        return Ok(message);
+    }
+    // 2. Connect RPC envelope: flags byte + big-endian u32 length.
+    if raw.len() > 5 {
+        let len = u32::from_be_bytes([raw[1], raw[2], raw[3], raw[4]]) as usize;
+        if len + 5 == raw.len() {
+            if let Some(message) = try_decode(&raw[5..]) {
+                tracing::warn!("BidiAppend payload had a 5-byte Connect frame");
+                return Ok(message);
+            }
+        }
+    }
+    // 3. Varint length prefix followed by the message body.
+    let mut value: usize = 0;
+    let mut shift = 0usize;
+    let mut prefix_end = 0usize;
+    for (index, byte) in raw.iter().enumerate().take(5) {
+        value |= ((byte & 0x7f) as usize) << shift;
+        shift += 7;
+        if byte & 0x80 == 0 {
+            prefix_end = index + 1;
+            break;
+        }
+    }
+    if prefix_end > 0 && value + prefix_end == raw.len() {
+        if let Some(message) = try_decode(&raw[prefix_end..]) {
+            tracing::warn!("BidiAppend payload had a {prefix_end}-byte varint length prefix");
+            return Ok(message);
+        }
+    }
+    // 4. Concatenated messages: decode the first and report the rest.
+    let probe_limit = raw.len().min(32 * 1024);
+    for end in 1..=probe_limit {
+        if let Some(first) = try_decode(&raw[..end]) {
+            tracing::warn!(
+                "BidiAppend payload had concatenated messages: first used {end} of {} bytes",
+                raw.len()
+            );
+            return Ok(first);
+        }
+    }
+    Err(Error::Protocol(
+        "BidiAppend payload does not match any known encoding".into(),
+    ))
 }
 
 pub async fn append(
@@ -189,6 +335,16 @@ pub async fn append(
         .get_or_create_for_append(&request.request_id, replace_closing)
         .await?;
     let _admission = handle.admit()?;
+    // 3.30 invoke_model frames carry the client-generated invocation id. Store
+    // it on the handle for the SSE bridge; do not replay control frames into
+    // the legacy run engine (the run was already driven by run_request).
+    if let Some(invocation_id) = request.invocation_id.as_deref() {
+        handle.set_invocation_id(invocation_id);
+        return Ok(ai::BidiAppendResponse {});
+    }
+    if request.is_inference_control {
+        return Ok(ai::BidiAppendResponse {});
+    }
     if let Some(conversation_id) = request.conversation_id() {
         handle.set_conversation_id(conversation_id)?;
     }

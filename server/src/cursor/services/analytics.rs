@@ -14,6 +14,7 @@ use crate::{api::cursor::proxy, Error, Result};
 
 pub const BOOTSTRAP_STATSIG_PATH: &str = "/aiserver.v1.AnalyticsService/BootstrapStatsig";
 const AGENT_RETRIES_GATE: &str = "nal_agent_retries";
+const AGENT_LOCAL_LOOP_GATE: &str = "agent_host_local_loop";
 const LOCAL_RULE: &str = "local_enabled";
 
 #[derive(Clone, PartialEq, Message)]
@@ -52,6 +53,7 @@ fn patch_upstream(response: proxy::BufferedResponse) -> Result<Response<Body>> {
     let mut message = BootstrapStatsigResponse::decode(payload)?;
     let mut config = serde_json::from_str::<Value>(&message.config)?;
     enable_agent_retries(&mut config)?;
+    disable_local_loop(&mut config);
     message.config = serde_json::to_string(&config)?;
     Ok(response.with_body(encode_unary(&message, framed)))
 }
@@ -75,6 +77,7 @@ fn local_response() -> Result<Response<Body>> {
         "time": generated_at_ms
     });
     enable_agent_retries(&mut config)?;
+    disable_local_loop(&mut config);
     let message = BootstrapStatsigResponse {
         config: serde_json::to_string(&config)?,
         generated_at_ms,
@@ -110,6 +113,26 @@ fn enable_agent_retries(config: &mut Value) -> Result<()> {
     Ok(())
 }
 
+/// Force Cursor 3.30+ agent host to take the legacy backend loop (AgentService/RunSSE)
+/// instead of the managed local loop (InferenceService/RunInferenceSSE).
+///
+/// The local loop requires prompt_model_metadata in run_ready and an invocation_id
+/// that matches a client-side queue; our bridge cannot supply a matching id reliably,
+/// so every local-loop turn stalls. Setting `agent_host_local_loop` to false makes the
+/// client route turns through the backend loop that BYOK already supports natively.
+fn disable_local_loop(config: &mut Value) {
+    let gate_key = statsig_key(config, AGENT_LOCAL_LOOP_GATE);
+    if let Some(root) = config.as_object_mut() {
+        let gates = root
+            .entry("feature_gates")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if let Some(gates) = gates.as_object_mut() {
+            gates.insert(gate_key.clone(), disabled_gate(&gate_key));
+            tracing::info!(gate = %gate_key, "Statsig: forcing agent_host_local_loop=false (use legacy RunSSE path)");
+        }
+    }
+}
+
 fn statsig_key(config: &Value, name: &str) -> String {
     match config.get("hash_used").and_then(Value::as_str) {
         Some("djb2") => djb2(name),
@@ -131,6 +154,25 @@ fn enabled_gate(name: &str) -> Value {
     json!({
         "name": name,
         "value": true,
+        "rule_id": LOCAL_RULE,
+        "ruleID": LOCAL_RULE,
+        "group_name": LOCAL_RULE,
+        "groupName": LOCAL_RULE,
+        "secondary_exposures": [],
+        "secondaryExposures": [],
+        "undelegated_secondary_exposures": [],
+        "undelegatedSecondaryExposures": [],
+        "is_device_based": false,
+        "isDeviceBased": false,
+        "id_type": "userID",
+        "idType": "userID"
+    })
+}
+
+fn disabled_gate(name: &str) -> Value {
+    json!({
+        "name": name,
+        "value": false,
         "rule_id": LOCAL_RULE,
         "ruleID": LOCAL_RULE,
         "group_name": LOCAL_RULE,

@@ -32,8 +32,12 @@ impl StartupDiagnostics {
             .max_log_files(RETAINED_LOG_FILES)
             .build(&log_directory)?;
         let (file_writer, writer_guard) = tracing_appender::non_blocking(file_appender);
-        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| "cursor_byok_desktop=info,cursor_server=info".into());
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            // Run/conversation/checkpoint modules at debug: needed to trace
+            // Cursor 3.30 run stalls (checkpoint publish, client acks).
+            "cursor_byok_desktop=info,cursor_server=info,cursor_server::run=debug,cursor_server::cursor::conversation=debug,cursor_server::cursor::checkpoint=debug,cursor_server::cursor::transport=debug"
+                .into()
+        });
 
         tracing_subscriber::registry()
             .with(filter)

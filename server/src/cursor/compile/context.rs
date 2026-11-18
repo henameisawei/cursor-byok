@@ -474,10 +474,9 @@ pub fn dynamic_mcp(
     request: &pb::AgentRunRequest,
     context: &pb::RequestContext,
 ) -> Result<BTreeMap<String, (pb::McpToolDefinition, ToolDefinition)>> {
-    let direct = request
-        .mcp_tools
-        .iter()
-        .flat_map(|tools| tools.mcp_tools.iter());
+    // Cursor >= 3.30 removed AgentRunRequest.mcp_tools; direct tools are
+    // gone, only context-provided tools remain.
+    let direct: std::iter::Empty<&pb::McpToolDefinition> = std::iter::empty();
     let contextual = context.tools.iter();
     let mut output = BTreeMap::new();
     for wire in direct.chain(contextual) {

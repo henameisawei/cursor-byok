@@ -14,6 +14,33 @@ pub mod aiserver {
             pub request_id: String,
         }
 
+        /// Cursor >= 3.30 streams Run output over `aiserver.v1.HealthService`
+        /// instead of `agent.v1.AgentService/RunSSE`. The payload is handed
+        /// back as hex-encoded AgentServerMessage bytes.
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        pub struct BidiPollRequest {
+            #[prost(message, optional, tag = "1")]
+            pub request_id: Option<BidiRequestId>,
+            #[prost(bool, optional, tag = "2")]
+            pub start_request: Option<bool>,
+        }
+
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        pub struct BidiPollResponse {
+            #[prost(int64, tag = "1")]
+            pub seqno: i64,
+            #[prost(string, tag = "2")]
+            pub data: String,
+            #[prost(bool, optional, tag = "3")]
+            pub eof: Option<bool>,
+        }
+
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        pub struct HealthResponse {
+            #[prost(string, tag = "1")]
+            pub payload: String,
+        }
+
         #[derive(Clone, PartialEq, ::prost::Message)]
         pub struct BidiAppendRequest {
             #[prost(string, tag = "1")]
@@ -55,6 +82,36 @@ pub mod aiserver {
 
         #[derive(Clone, Copy, PartialEq, ::prost::Message)]
         pub struct BidiAppendResponse {}
+
+        /// Cursor >= 3.30 local loop multiplexes `RunInferenceClientMessage`
+        /// frames through `BidiAppend.data_binary` (instead of the legacy
+        /// `AgentClientMessage`). We only model `invoke_model`, which carries
+        /// the client-generated invocation id we must echo back verbatim on
+        /// the `RunInferenceSSE` response so the client can match the queue.
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        pub struct RunInferenceClientMessage {
+            #[prost(message, optional, tag = "1")]
+            pub run_request: Option<RunInferenceRunRequest>,
+            #[prost(message, optional, tag = "2")]
+            pub invoke_model: Option<RunInferenceInvokeModel>,
+        }
+
+        /// Minimal `RunInferenceRunRequest`: field 1 is the conversation id.
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        pub struct RunInferenceRunRequest {
+            #[prost(string, tag = "1")]
+            pub conversation_id: String,
+        }
+
+        /// `invoke_model` (field 2 of RunInferenceClientMessage). Field 1 is
+        /// the invocation id (`${requestId}-${count}-${suffix}`); field 2 is
+        /// the fully-built prompt, which we ignore because the legacy run
+        /// request already drove the model call.
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        pub struct RunInferenceInvokeModel {
+            #[prost(string, tag = "1")]
+            pub invocation_id: String,
+        }
 
         /// `NetworkService/IsConnected` reply. The Cursor extension probes this
         /// ~10s after any slow request starts; a non-OK result is treated as

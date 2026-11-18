@@ -30,6 +30,10 @@ pub struct TransportHandle {
     output: Arc<OutputHub>,
     conversation_id: Arc<OnceLock<String>>,
     parent: Arc<OnceLock<TransportParent>>,
+    /// Cursor >= 3.30 sends the client-generated invocation id via an
+    /// `invoke_model` frame inside BidiAppend. The RunInferenceSSE bridge must
+    /// echo this exact id back so the client matches the response queue.
+    invocation_id: Arc<OnceLock<String>>,
     trace: CursorTraceRecorder,
     lifecycle: TransportLifecycle,
     disconnect: CancellationToken,
@@ -48,6 +52,7 @@ impl TransportHandle {
             output,
             conversation_id: Arc::new(OnceLock::new()),
             parent: Arc::new(OnceLock::new()),
+            invocation_id: Arc::new(OnceLock::new()),
             trace,
             lifecycle: TransportLifecycle::new(),
             disconnect: CancellationToken::new(),
@@ -78,6 +83,20 @@ impl TransportHandle {
 
     pub fn conversation_id(&self) -> Option<&str> {
         self.conversation_id.get().map(String::as_str)
+    }
+
+    /// Store the client-generated invocation id (first write wins). The id is
+    /// delivered via an `invoke_model` frame on BidiAppend after the SSE stream
+    /// opens, so a plain `OnceLock` gives us the "wait until available" slot.
+    pub fn set_invocation_id(&self, invocation_id: &str) {
+        if invocation_id.is_empty() {
+            return;
+        }
+        let _ = self.invocation_id.set(invocation_id.to_string());
+    }
+
+    pub fn invocation_id(&self) -> Option<&str> {
+        self.invocation_id.get().map(String::as_str)
     }
 
     pub fn set_parent(&self, parent: TransportParent) -> Result<()> {
@@ -118,6 +137,34 @@ impl TransportHandle {
     }
 
     pub fn emit(&self, message: &pb::AgentServerMessage) -> Result<()> {
+        // PROBE: record what the run engine writes into this request's hub, so
+        // we can compare against what the SSE bridge reads from the same hub.
+        let kind = match message.message.as_ref() {
+            None => "none",
+            Some(pb::agent_server_message::Message::InteractionUpdate(u)) => {
+                match u.message.as_ref() {
+                    Some(pb::interaction_update::Message::TextDelta(_)) => "text_delta",
+                    Some(pb::interaction_update::Message::ThinkingDelta(_)) => "thinking_delta",
+                    Some(pb::interaction_update::Message::TokenDelta(_)) => "token_delta",
+                    Some(pb::interaction_update::Message::Heartbeat(_)) => "heartbeat",
+                    Some(pb::interaction_update::Message::TurnEnded(_)) => "turn_ended",
+                    Some(_) => "interaction_other",
+                    None => "interaction_none",
+                }
+            }
+            Some(pb::agent_server_message::Message::ExecServerMessage(_)) => "exec",
+            Some(pb::agent_server_message::Message::ExecServerControlMessage(_)) => "exec_control",
+            Some(pb::agent_server_message::Message::ConversationCheckpointUpdate(_)) => {
+                "checkpoint_update"
+            }
+            Some(pb::agent_server_message::Message::KvServerMessage(_)) => "kv",
+            Some(pb::agent_server_message::Message::InteractionQuery(_)) => "interaction_query",
+        };
+        tracing::info!(
+            request_id = %self.request_id,
+            kind,
+            "PROBE hub emit"
+        );
         if self.emit_frame(connect::encode_message(message)?) {
             Ok(())
         } else {

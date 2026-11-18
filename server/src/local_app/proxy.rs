@@ -114,6 +114,13 @@ impl HttpHandler for CursorRelay {
     ) -> RequestOrResponse {
         let original = request.uri().clone();
         let locally_routed = should_route_locally(original.path(), *self.tab_mode.read());
+        tracing::info!(
+            method = %request.method(),
+            path = %original.path(),
+            locally_routed,
+            upgrade = request.headers().contains_key("upgrade"),
+            "cursor proxy request"
+        );
         if is_cursor_host(original.host().unwrap_or_default()) && locally_routed {
             if let Ok(value) = original.to_string().parse() {
                 request.headers_mut().insert(UPSTREAM_URL_HEADER, value);
@@ -134,10 +141,10 @@ impl HttpHandler for CursorRelay {
         _ctx: &HttpContext,
         request: &Request<Body>,
     ) -> bool {
-        request
-            .uri()
-            .authority()
-            .is_some_and(|authority| is_cursor_host(authority.host()))
+        let host = request.uri().authority().map(|authority| authority.host().to_owned());
+        let intercept = host.as_deref().is_some_and(is_cursor_host);
+        tracing::info!(?host, intercept, "cursor proxy CONNECT");
+        intercept
     }
 
     async fn should_intercept_tls(
@@ -145,19 +152,42 @@ impl HttpHandler for CursorRelay {
         _ctx: &HttpContext,
         hello: hudsucker::rustls::server::ClientHello<'_>,
     ) -> bool {
-        hello.server_name().is_some_and(is_cursor_host)
+        let sni = hello.server_name();
+        let alpn = hello.alpn();
+        let intercept = sni.is_some_and(is_cursor_host);
+        tracing::info!(
+            sni,
+            alpn = alpn
+                .map(|protocols| protocols
+                    .map(|protocol| String::from_utf8_lossy(protocol).to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")),
+            intercept,
+            "cursor proxy TLS hello"
+        );
+        intercept
     }
 }
 
 pub fn is_cursor_host(host: &str) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
-    matches!(host.as_str(), "api2.cursor.sh" | "api3.cursor.sh") || host.ends_with(".cursor.sh")
+    matches!(
+        host.as_str(),
+        "api2.cursor.sh" | "api3.cursor.sh" | "api.cursor.com" | "cursor.com"
+    ) || host.ends_with(".cursor.sh")
+        || host.ends_with(".cursor.com")
 }
 
 fn is_local_path(path: &str) -> bool {
     matches!(
         path,
         "/agent.v1.AgentService/RunSSE"
+            | "/agent.v1.AgentService/RunPoll"
+            | "/agent/v1/run"
+            | "/aiserver.v1.InferenceService/RunInferenceSSE"
+            | "/aiserver.v1.InferenceService/RunInferencePoll"
+            | "/aiserver.v1.HealthService/StreamBidiPoll"
+            | "/aiserver.v1.HealthService/StreamBidiSSE"
             | "/aiserver.v1.BidiService/BidiAppend"
             | "/aiserver.v1.AiService/AvailableDocs"
             | "/aiserver.v1.DashboardService/GetEffectiveUserPlugins"

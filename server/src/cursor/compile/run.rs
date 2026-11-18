@@ -67,8 +67,9 @@ pub(crate) async fn prepare(
         context_sync,
         local_rules_dir,
     } = dependencies;
+    // Cursor >= 3.30 no longer sends prefetched blobs (field removed)
     checkpoint
-        .import_prefetched(&request.pre_fetched_blobs)
+        .import_prefetched(&[])
         .await?;
     let conversation_id = ConversationId::new(
         request
@@ -134,11 +135,8 @@ pub(crate) async fn prepare(
         compacting,
         background_completion,
     } = action(request)?;
-    let checkpoint_mode = if request.subagent_type_name.is_some() {
-        Mode::Subagent
-    } else {
-        mode_from_proto(mode_number)?
-    };
+    // Cursor >= 3.30 removed subagent_type_name from AgentRunRequest
+    let checkpoint_mode = mode_from_proto(mode_number)?;
     let mut model = model::requested_model(request)?;
     if let Some(configured_model) = store.model(&model.model_id).await? {
         configured_model.configure(&mut model);
@@ -213,6 +211,13 @@ pub(crate) async fn prepare(
                 .await?,
             );
         }
+    }
+    // Cursor >= 3.30 sends no ConversationAction, so the synthetic user
+    // turn has no upstream event id. Anchor it to the transport request
+    // id so a retried BidiAppend reuses the stored runtime message
+    // instead of duplicating the turn.
+    if event_id.is_none() && turn_user.is_some() {
+        event_id = Some(format!("330:{request_id}"));
     }
     let existing_runtime = match event_id.as_deref() {
         Some(event_id) => {
@@ -410,6 +415,35 @@ fn action(request: &pb::AgentRunRequest) -> Result<ActionProjection> {
         .as_ref()
         .and_then(|action| action.action.as_ref())
     else {
+        // Cursor >= 3.30: ConversationAction is no longer sent; the user
+        // message arrives in AgentRunRequest.user_content instead.
+        if let Some(content) = request.user_content.as_ref() {
+            let text = content.text.as_deref().unwrap_or("").trim().to_string();
+            if !text.is_empty() {
+                let user = pb::UserMessage {
+                    text,
+                    message_id: format!(
+                        "330:{}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0)
+                    ),
+                    mode,
+                    ..Default::default()
+                };
+                return Ok(ActionProjection {
+                    mode,
+                    turn_user: Some(user),
+                    action_context: String::new(),
+                    event_id: None,
+                    input_id: None,
+                    starts_turn: true,
+                    compacting: false,
+                    background_completion: false,
+                });
+            }
+        }
         return Ok(ActionProjection {
             mode,
             turn_user: None,
@@ -601,7 +635,7 @@ fn exec_context(
             .unwrap_or_else(|| conversation_id.to_string()),
         default_subagent_model: model_id.into(),
         subagent_model,
-        allow_subagents: request.subagent_type_name.is_none() && !subagents_disabled,
+        allow_subagents: !subagents_disabled, // 3.30 removed subagent_type_name
         subagents_disabled,
         terminals_folder: request_context
             .env

@@ -10,9 +10,9 @@ use tower_http::decompression::RequestDecompressionLayer;
 
 use crate::{
     api::cursor::{
-        bidi,
+        agent_ws, bidi,
         proxy::{self, CursorProxy},
-        run_sse,
+        run_inference, run_sse,
     },
     cursor::{
         protocol::{
@@ -47,6 +47,20 @@ fn router_with_proxy(
     Router::new()
         .route("/__byok-api__/healthz", get(health))
         .route("/agent.v1.AgentService/RunSSE", post(run_sse_handler))
+        .route(
+            "/aiserver.v1.InferenceService/RunInferenceSSE",
+            post(run_inference_handler),
+        )
+        .route("/agent/v1/run", get(agent_ws::upgrade))
+        .route("/agent.v1.AgentService/RunPoll", post(health_poll_handler))
+        .route(
+            "/aiserver.v1.HealthService/StreamBidiPoll",
+            post(health_poll_handler),
+        )
+        .route(
+            "/aiserver.v1.HealthService/StreamBidiSSE",
+            post(health_sse_handler),
+        )
         .route("/aiserver.v1.BidiService/BidiAppend", post(bidi_handler))
         .route(
             "/aiserver.v1.AiService/AvailableDocs",
@@ -219,6 +233,97 @@ async fn run_sse_handler(
                 generation,
                 response,
                 Some(trace),
+            )
+            .await)
+        }
+    }
+}
+
+async fn run_inference_handler(
+    State(registry): State<TransportRegistry>,
+    request: Request<Body>,
+) -> Result<Response<Body>> {
+    let (_parts, body) = buffered(request).await?;
+    let request: agent::BidiRequestId = connect::decode_unary(&body)?;
+    tracing::info!(
+        request_id = request.request_id,
+        "run inference SSE stream opened"
+    );
+    match registry.wait_route(&request.request_id).await {
+        crate::cursor::transport::TransportRoute::Local => {
+            run_inference::stream(&registry, &request.request_id, None).await
+        }
+        crate::cursor::transport::TransportRoute::Upstream(_) => {
+            // BYOK does not proxy the legacy inference protocol; answer with an
+            // empty completed stream rather than leaking this request upstream.
+            run_inference::stream(&registry, &request.request_id, None).await
+        }
+    }
+}
+
+async fn health_poll_handler(
+    State(registry): State<TransportRegistry>,
+    Extension(proxy): Extension<CursorProxy>,
+    request: Request<Body>,
+) -> Result<Response<Body>> {
+    let (parts, body) = buffered(request).await?;
+    let request: ai::BidiPollRequest = connect::decode_unary(&body)?;
+    let request_id = request
+        .request_id
+        .map(|id| id.request_id)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| crate::Error::Protocol("BidiPollRequest request_id is required".into()))?;
+    tracing::info!(
+        request_id,
+        start_request = ?request.start_request,
+        "health poll stream opened"
+    );
+    match registry.wait_route(&request_id).await {
+        crate::cursor::transport::TransportRoute::Local => {
+            run_sse::stream_poll(&registry, &request_id).await
+        }
+        crate::cursor::transport::TransportRoute::Upstream(generation) => {
+            let response = proxy::forward(
+                Extension(proxy),
+                Request::from_parts(parts, Body::from(body)),
+            )
+            .await?;
+            Ok(run_sse::upstream(
+                registry,
+                request_id,
+                generation,
+                response,
+                None,
+            )
+            .await)
+        }
+    }
+}
+
+async fn health_sse_handler(
+    State(registry): State<TransportRegistry>,
+    Extension(proxy): Extension<CursorProxy>,
+    request: Request<Body>,
+) -> Result<Response<Body>> {
+    let (parts, body) = buffered(request).await?;
+    let request: ai::BidiRequestId = connect::decode_unary(&body)?;
+    tracing::info!(request_id = request.request_id, "health SSE stream opened");
+    match registry.wait_route(&request.request_id).await {
+        crate::cursor::transport::TransportRoute::Local => {
+            run_sse::stream_health(&registry, &request.request_id).await
+        }
+        crate::cursor::transport::TransportRoute::Upstream(generation) => {
+            let response = proxy::forward(
+                Extension(proxy),
+                Request::from_parts(parts, Body::from(body)),
+            )
+            .await?;
+            Ok(run_sse::upstream(
+                registry,
+                request.request_id,
+                generation,
+                response,
+                None,
             )
             .await)
         }

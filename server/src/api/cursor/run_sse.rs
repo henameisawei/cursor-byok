@@ -10,7 +10,10 @@ use tokio_stream::StreamExt;
 
 use crate::{
     cursor::{
-        protocol::connect::{self, END_STREAM_FLAG},
+        protocol::{
+            connect::{self, END_STREAM_FLAG},
+            proto::aiserver::v1 as ai,
+        },
         services::observability::CursorTraceRecorder,
         transport::{TransportHandle, TransportRegistry},
     },
@@ -38,6 +41,105 @@ pub async fn stream(registry: &TransportRegistry, request_id: &str) -> Result<Re
         .headers_mut()
         .insert("connect-protocol-version", HeaderValue::from_static("1"));
     Ok(response)
+}
+
+/// Cursor >= 3.30 no longer reads Run output from `AgentService/RunSSE`.
+/// The client opens a server-streaming transport on `aiserver.v1.HealthService`
+/// (`StreamBidiPoll` / `StreamBidiSSE`) and expects the same Connect-framed
+/// `AgentServerMessage` bytes, hex-encoded inside the envelope. Both helpers
+/// below replay the transport output through the requested envelope.
+pub async fn stream_poll(registry: &TransportRegistry, request_id: &str) -> Result<Response<Body>> {
+    let handle = registry.get_or_create(request_id).await?;
+    let receiver = handle.subscribe();
+    Ok(stream_response(Body::from_stream(poll_body_stream(receiver))))
+}
+
+pub async fn stream_health(registry: &TransportRegistry, request_id: &str) -> Result<Response<Body>> {
+    let handle = registry.get_or_create(request_id).await?;
+    let receiver = handle.subscribe();
+    Ok(stream_response(Body::from_stream(health_body_stream(receiver))))
+}
+
+fn stream_response(body: Body) -> Response<Body> {
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
+        .headers_mut()
+        .insert("connect-protocol-version", HeaderValue::from_static("1"));
+    response
+}
+
+fn poll_body_stream(
+    mut receiver: mpsc::UnboundedReceiver<Bytes>,
+) -> impl tokio_stream::Stream<Item = std::result::Result<Bytes, Infallible>> {
+    async_stream::stream! {
+        let mut seqno: i64 = 0;
+        while let Some(chunk) = receiver.recv().await {
+            if is_end_stream_frame(&chunk) {
+                break;
+            }
+            let Ok(frames) = connect::decode_frames(&chunk) else {
+                continue;
+            };
+            for (flags, payload) in frames {
+                if flags & END_STREAM_FLAG != 0 {
+                    continue;
+                }
+                let response = ai::BidiPollResponse {
+                    seqno,
+                    data: hex::encode(&payload),
+                    eof: None,
+                };
+                let Ok(frame) = connect::encode_message(&response) else {
+                    return;
+                };
+                seqno += 1;
+                yield Ok::<Bytes, Infallible>(frame);
+            }
+        }
+        if let Ok(frame) = connect::encode_message(&ai::BidiPollResponse {
+            seqno,
+            data: String::new(),
+            eof: Some(true),
+        }) {
+            yield Ok(frame);
+        }
+    }
+}
+
+fn health_body_stream(
+    mut receiver: mpsc::UnboundedReceiver<Bytes>,
+) -> impl tokio_stream::Stream<Item = std::result::Result<Bytes, Infallible>> {
+    async_stream::stream! {
+        while let Some(chunk) = receiver.recv().await {
+            if is_end_stream_frame(&chunk) {
+                break;
+            }
+            let Ok(frames) = connect::decode_frames(&chunk) else {
+                continue;
+            };
+            for (flags, payload) in frames {
+                if flags & END_STREAM_FLAG != 0 {
+                    continue;
+                }
+                let response = ai::HealthResponse {
+                    payload: hex::encode(&payload),
+                };
+                let Ok(frame) = connect::encode_message(&response) else {
+                    return;
+                };
+                yield Ok::<Bytes, Infallible>(frame);
+            }
+        }
+        yield Ok(connect::encode_end_stream());
+    }
 }
 
 fn local_body_stream(

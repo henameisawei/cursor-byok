@@ -420,7 +420,6 @@ impl ConversationRuntime {
                                             let mut request = previous.request.clone();
                                             request.action = Some(conversation_action);
                                             request.conversation_state = None;
-                                            request.pre_fetched_blobs.clear();
                                             waiting_for_action = false;
                                             start_generation(
                                                 &registry,
